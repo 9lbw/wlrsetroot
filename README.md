@@ -40,3 +40,7 @@ Requires: wayland-client, wayland-protocols, meson, ninja
 meson setup build
 ninja -C build
 ```
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE).
