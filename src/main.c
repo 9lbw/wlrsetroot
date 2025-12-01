@@ -15,6 +15,19 @@
 
 #define VERSION "0.1.0"
 
+// Built-in gray pattern (2x2 checkerboard, same as X11's gray_bits)
+static const unsigned char gray_bits[] = { 0x01, 0x02 };
+#define GRAY_WIDTH 2
+#define GRAY_HEIGHT 2
+
+// Pattern type enum
+enum pattern_type {
+    PATTERN_NONE,
+    PATTERN_XBM,
+    PATTERN_GRAY,
+    PATTERN_MOD,
+};
+
 // Global state
 struct wlrsetroot_state {
     struct wl_display *display;
@@ -25,10 +38,14 @@ struct wlrsetroot_state {
     
     struct wl_list outputs;  // list of wlrsetroot_output
     
+    enum pattern_type pattern;
     struct xbm_image *xbm;
+    int mod_x;  // modula pattern x spacing
+    int mod_y;  // modula pattern y spacing
     uint32_t fg_color;  // ARGB format
     uint32_t bg_color;  // ARGB format
     float pattern_scale;  // Scale factor for XBM pattern (default 1.0)
+    bool reverse;  // swap fg/bg colors
     
     bool running;
 };
@@ -79,35 +96,84 @@ static bool parse_color(const char *str, uint32_t *color) {
     return true;
 }
 
-// Render the XBM pattern tiled across the buffer
-static void render_tiled_xbm(struct wlrsetroot_output *output) {
+// Get pixel from built-in gray pattern (2x2 checkerboard)
+static int gray_get_pixel(unsigned int x, unsigned int y) {
+    size_t byte_index = y * ((GRAY_WIDTH + 7) / 8) + x / 8;
+    unsigned int bit_index = x % 8;
+    return (gray_bits[byte_index] >> bit_index) & 1;
+}
+
+// Get pixel from modula pattern (like xsetroot's MakeModulaBitmap)
+// Creates a 16x16 grid pattern based on mod_x and mod_y spacing
+static int mod_get_pixel(int mod_x, int mod_y, unsigned int x, unsigned int y) {
+    // Wrap to 16x16 tile
+    x = x % 16;
+    y = y % 16;
+    
+    // Every mod_y'th row is fully lit
+    if ((y % mod_y) == 0) {
+        return 1;
+    }
+    // Every mod_x'th column is lit
+    if ((x % mod_x) == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+// Render the pattern tiled across the buffer
+static void render_tiled_pattern(struct wlrsetroot_output *output) {
     struct wlrsetroot_state *state = output->state;
     uint32_t *pixels = output->buffer.data;
     uint32_t buf_width = output->buffer.width;
     uint32_t buf_height = output->buffer.height;
     
-    if (!state->xbm) {
+    // Apply reverse if set
+    uint32_t fg = state->reverse ? state->bg_color : state->fg_color;
+    uint32_t bg = state->reverse ? state->fg_color : state->bg_color;
+    
+    if (state->pattern == PATTERN_NONE) {
         // Solid background color
         for (uint32_t i = 0; i < buf_width * buf_height; i++) {
-            pixels[i] = state->bg_color;
+            pixels[i] = bg;
         }
         return;
     }
     
-    struct xbm_image *xbm = state->xbm;
     float scale = state->pattern_scale;
-    float xbm_width_f = (float)xbm->width;
-    float xbm_height_f = (float)xbm->height;
     
     for (uint32_t y = 0; y < buf_height; y++) {
         for (uint32_t x = 0; x < buf_width; x++) {
-            // Tile the XBM pattern with float scaling
-            unsigned int xbm_x = (unsigned int)fmodf(x / scale, xbm_width_f);
-            unsigned int xbm_y = (unsigned int)fmodf(y / scale, xbm_height_f);
+            int pixel = 0;
             
-            int pixel = xbm_get_pixel(xbm, xbm_x, xbm_y);
+            switch (state->pattern) {
+            case PATTERN_XBM: {
+                struct xbm_image *xbm = state->xbm;
+                float xbm_width_f = (float)xbm->width;
+                float xbm_height_f = (float)xbm->height;
+                unsigned int xbm_x = (unsigned int)fmodf(x / scale, xbm_width_f);
+                unsigned int xbm_y = (unsigned int)fmodf(y / scale, xbm_height_f);
+                pixel = xbm_get_pixel(xbm, xbm_x, xbm_y);
+                break;
+            }
+            case PATTERN_GRAY: {
+                unsigned int gray_x = (unsigned int)fmodf(x / scale, (float)GRAY_WIDTH);
+                unsigned int gray_y = (unsigned int)fmodf(y / scale, (float)GRAY_HEIGHT);
+                pixel = gray_get_pixel(gray_x, gray_y);
+                break;
+            }
+            case PATTERN_MOD: {
+                unsigned int mod_px = (unsigned int)(x / scale);
+                unsigned int mod_py = (unsigned int)(y / scale);
+                pixel = mod_get_pixel(state->mod_x, state->mod_y, mod_px, mod_py);
+                break;
+            }
+            default:
+                break;
+            }
+            
             // XBM convention: 1 = background, 0 = foreground (matches xsetroot)
-            pixels[y * buf_width + x] = pixel ? state->bg_color : state->fg_color;
+            pixels[y * buf_width + x] = pixel ? bg : fg;
         }
     }
 }
@@ -118,6 +184,7 @@ static void layer_surface_configure(void *data,
                                     uint32_t serial,
                                     uint32_t width,
                                     uint32_t height) {
+    (void)surface;
     struct wlrsetroot_output *output = data;
     
     output->width = width;
@@ -128,6 +195,7 @@ static void layer_surface_configure(void *data,
 
 static void layer_surface_closed(void *data,
                                  struct zwlr_layer_surface_v1 *surface) {
+    (void)surface;
     struct wlrsetroot_output *output = data;
     
     if (output->layer_surface) {
@@ -219,8 +287,8 @@ static void render_output(struct wlrsetroot_output *output) {
         }
     }
     
-    // Render the XBM pattern
-    render_tiled_xbm(output);
+    // Render the pattern
+    render_tiled_pattern(output);
     
     // Ack configure
     zwlr_layer_surface_v1_ack_configure(output->layer_surface,
@@ -239,16 +307,20 @@ static void output_geometry(void *data, struct wl_output *wl_output,
                            int32_t physical_height, int32_t subpixel,
                            const char *make, const char *model,
                            int32_t transform) {
-    // Not used
+    (void)data; (void)wl_output; (void)x; (void)y;
+    (void)physical_width; (void)physical_height; (void)subpixel;
+    (void)make; (void)model; (void)transform;
 }
 
 static void output_mode(void *data, struct wl_output *wl_output,
                        uint32_t flags, int32_t width, int32_t height,
                        int32_t refresh) {
-    // Not used - we get size from layer surface configure
+    (void)data; (void)wl_output; (void)flags;
+    (void)width; (void)height; (void)refresh;
 }
 
 static void output_done(void *data, struct wl_output *wl_output) {
+    (void)wl_output;
     struct wlrsetroot_output *output = data;
     
     if (!output->layer_surface) {
@@ -257,17 +329,18 @@ static void output_done(void *data, struct wl_output *wl_output) {
 }
 
 static void output_scale(void *data, struct wl_output *wl_output, int32_t scale) {
+    (void)wl_output;
     struct wlrsetroot_output *output = data;
     output->scale = scale;
 }
 
 static void output_name(void *data, struct wl_output *wl_output, const char *name) {
-    // Not used for now
+    (void)data; (void)wl_output; (void)name;
 }
 
 static void output_description(void *data, struct wl_output *wl_output,
                                const char *description) {
-    // Not used
+    (void)data; (void)wl_output; (void)description;
 }
 
 static const struct wl_output_listener output_listener = {
@@ -300,6 +373,7 @@ static void destroy_output(struct wlrsetroot_output *output) {
 static void registry_global(void *data, struct wl_registry *registry,
                            uint32_t name, const char *interface,
                            uint32_t version) {
+    (void)version;
     struct wlrsetroot_state *state = data;
     
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
@@ -331,6 +405,7 @@ static void registry_global(void *data, struct wl_registry *registry,
 
 static void registry_global_remove(void *data, struct wl_registry *registry,
                                    uint32_t name) {
+    (void)registry;
     struct wlrsetroot_state *state = data;
     
     struct wlrsetroot_output *output, *tmp;
@@ -352,18 +427,22 @@ static void print_usage(const char *prog) {
            "\n"
            "Options:\n"
            "  -bitmap <file>    XBM file to use as wallpaper pattern\n"
+           "  -mod <x> <y>      Use a plaid-like grid pattern (16x16 tile)\n"
+           "  -gray, -grey      Use a gray (checkerboard) pattern\n"
+           "  -solid <color>    Solid background color (no pattern)\n"
            "  -bg <color>       Background color (hex: #rrggbb or rrggbb)\n"
            "  -fg <color>       Foreground color (hex: #rrggbb or rrggbb)\n"
+           "  -rv, -reverse     Swap foreground and background colors\n"
            "  -scale <n>        Scale the pattern by factor n (0.1-32, default: 1)\n"
-           "  -solid <color>    Solid background color (no pattern)\n"
            "  -h, --help        Show this help message\n"
            "  -v, --version     Show version\n"
            "\n"
            "Examples:\n"
            "  %s -bitmap pattern.xbm -bg \"#1a1a2e\" -fg \"#e94560\"\n"
-           "  %s -bitmap pattern.xbm -bg \"#1a1a2e\" -fg \"#e94560\" -scale 1.5\n"
+           "  %s -gray -bg \"#1a1a2e\" -fg \"#e94560\"\n"
+           "  %s -mod 16 16 -bg \"#282a36\" -fg \"#44475a\"\n"
            "  %s -solid \"#282a36\"\n",
-           prog, prog, prog, prog);
+           prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char *argv[]) {
@@ -374,9 +453,11 @@ int main(int argc, char *argv[]) {
     state.bg_color = 0xFF000000;  // Black
     state.fg_color = 0xFFFFFFFF;  // White
     state.pattern_scale = 1.0f;   // No scaling by default
+    state.pattern = PATTERN_NONE;
+    state.reverse = false;
     
     const char *xbm_file = NULL;
-    bool solid_only = false;
+    int excl = 0;  // Count of exclusive options (bitmap, gray, mod, solid)
     
     // Parse arguments
     for (int i = 1; i < argc; i++) {
@@ -386,6 +467,26 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             xbm_file = argv[i];
+            state.pattern = PATTERN_XBM;
+            excl++;
+        } else if (strcmp(argv[i], "-gray") == 0 || strcmp(argv[i], "-grey") == 0) {
+            state.pattern = PATTERN_GRAY;
+            excl++;
+        } else if (strcmp(argv[i], "-mod") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "Missing x argument for -mod\n");
+                return 1;
+            }
+            state.mod_x = atoi(argv[i]);
+            if (state.mod_x <= 0) state.mod_x = 1;
+            if (++i >= argc) {
+                fprintf(stderr, "Missing y argument for -mod\n");
+                return 1;
+            }
+            state.mod_y = atoi(argv[i]);
+            if (state.mod_y <= 0) state.mod_y = 1;
+            state.pattern = PATTERN_MOD;
+            excl++;
         } else if (strcmp(argv[i], "-bg") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "Missing argument for -bg\n");
@@ -404,6 +505,8 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Invalid color: %s\n", argv[i]);
                 return 1;
             }
+        } else if (strcmp(argv[i], "-rv") == 0 || strcmp(argv[i], "-reverse") == 0) {
+            state.reverse = true;
         } else if (strcmp(argv[i], "-scale") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "Missing argument for -scale\n");
@@ -424,7 +527,8 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Invalid color: %s\n", argv[i]);
                 return 1;
             }
-            solid_only = true;
+            state.pattern = PATTERN_NONE;
+            excl++;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -438,8 +542,14 @@ int main(int argc, char *argv[]) {
         }
     }
     
+    // Check for multiple exclusive options
+    if (excl > 1) {
+        fprintf(stderr, "Error: choose only one of {-bitmap, -gray, -mod, -solid}\n");
+        return 1;
+    }
+    
     // Load XBM file if specified
-    if (xbm_file && !solid_only) {
+    if (state.pattern == PATTERN_XBM && xbm_file) {
         state.xbm = xbm_load(xbm_file);
         if (!state.xbm) {
             fprintf(stderr, "Failed to load XBM file: %s\n", xbm_file);
