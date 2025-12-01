@@ -1,0 +1,16 @@
+# Build directory
+build/
+
+# Nix
+result
+result-*
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
