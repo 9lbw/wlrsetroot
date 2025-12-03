@@ -56,7 +56,7 @@
 
           meta = with pkgs.lib; {
             description = "XBM wallpaper setter for wlroots compositors";
-            license = licenses.mit;
+            license = licenses.gpl3;
             platforms = platforms.linux;
           };
         };
